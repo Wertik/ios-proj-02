@@ -40,7 +40,7 @@ typedef struct
 
 #define SHM_INT_SIZE sizeof(int)
 
-#define RAND_MICROS(limit) (rand() % limit) * 1000
+#define RAND_MICROS(limit) (rand() % (limit + 1)) * 1000
 
 bool parse_long(char *str, long *res)
 {
