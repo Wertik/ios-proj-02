@@ -10,6 +10,7 @@
 #include <time.h>
 #include <sys/mman.h>
 #include <stdarg.h>
+#include <errno.h>
 
 typedef struct
 {
@@ -25,6 +26,8 @@ typedef struct
 
 #define MUTEX_LOG_KEY "/ios-log-mutex"
 #define MUTEX_ATOM_KEY "/ios-atom-mutex"
+#define MUTEX_QUEUE_KEY "/ios-atom-queue-mutex"
+#define MUTEX_MOL_KEY "/ios-mol-queue-mutex"
 
 #define QUEUE_HYDRO_KEY "/ios-hydro-queue"
 #define QUEUE_OXY_KEY "/ios-oxy-queue"
@@ -265,14 +268,21 @@ void unlink_barrier(const char *shm_key, const char *sem_key)
 {
     if (shm_unlink(shm_key) == -1)
     {
-        perror("unlink_barrier (shm_unlink)");
-        _exit(EXIT_FAILURE);
+        // Ignore if it simply doesn't exist.
+        if (errno != ENOENT)
+        {
+            perror("unlink_barrier (shm_unlink)");
+            _exit(EXIT_FAILURE);
+        }
     }
 
     if (sem_unlink(sem_key) == -1)
     {
-        perror("unlink_barrier (sem_unlink)");
-        _exit(EXIT_FAILURE);
+        if (errno != ENOENT)
+        {
+            perror("unlink_barrier (shm_unlink)");
+            _exit(EXIT_FAILURE);
+        }
     }
 }
 
@@ -312,23 +322,25 @@ void write_log(const char *entry, ...)
 // Function for Oxygen processes.
 void oxy_process(long hydro_count, long intro_wait, long mol_wait, long id)
 {
-    srand(getpid() * time(NULL));
     write_log("O %ld: started\n", id);
 
+    srand(getpid() * time(NULL));
     usleep(RAND_MICROS(intro_wait));
 
     write_log("O %ld: going to queue\n", id);
 
-    sem_t *mutex = open_sem(MUTEX_ATOM_KEY);
+    // GOING INTO QUEUE
+
+    sem_t *atom_mutex = open_sem(MUTEX_ATOM_KEY);
     sem_t *hydro_queue = open_sem(QUEUE_HYDRO_KEY);
     sem_t *oxy_queue = open_sem(QUEUE_OXY_KEY);
 
     barrier_t barrier;
     open_barrier(&barrier, SHM_ATOM_BARRIER_KEY, BARRIER_ATOM_KEY, 3);
 
-    wait_sem(mutex);
+    wait_sem(atom_mutex);
 
-    // Increase oxygen count
+    // Increase oxygen count, release atoms for molecule if possible
 
     int *oxy_q_count = link_shm_int(SHM_OXY_KEY);
     int *hydro_q_count = link_shm_int(SHM_HYDRO_KEY);
@@ -338,11 +350,14 @@ void oxy_process(long hydro_count, long intro_wait, long mol_wait, long id)
 
     if (*hydro_q_count >= 2)
     {
+        // Release atoms
+
         *mol_count = *mol_count + 1;
 
         post_sem(hydro_queue);
         post_sem(hydro_queue);
         *hydro_q_count = *hydro_q_count - 2;
+
         post_sem(oxy_queue);
         *oxy_q_count = *oxy_q_count - 1;
     }
@@ -350,21 +365,31 @@ void oxy_process(long hydro_count, long intro_wait, long mol_wait, long id)
     {
         // Figure whether more bonds are possible
 
-        if (hydro_count - *mol_count * 2 < 2)
+        if (hydro_count - *mol_count * 2 < 2 || *oxy_q_count * 2 + *mol_count * 2 > hydro_count)
         {
             write_log("O %ld: not enough H\n", id);
+
+            unlink_shm(oxy_q_count);
+            unlink_shm(hydro_q_count);
+            unlink_shm(mol_count);
+
+            post_sem(atom_mutex);
+
+            close_barrier(&barrier);
+
+            close_sem(atom_mutex);
+            close_sem(hydro_queue);
+            close_sem(oxy_queue);
             return;
         }
 
-        post_sem(mutex);
+        post_sem(atom_mutex);
     }
 
     unlink_shm(oxy_q_count);
     unlink_shm(hydro_q_count);
 
-    wait_sem(oxy_queue);
-
-    // Make a bond
+    wait_sem(oxy_queue); // WAIT IN QUEUE
 
     write_log("O %ld: creating molecule %d\n", id, *mol_count);
 
@@ -376,13 +401,13 @@ void oxy_process(long hydro_count, long intro_wait, long mol_wait, long id)
 
     unlink_shm(mol_count);
 
-    post_sem(mutex);
+    post_sem(atom_mutex);
 
     // Dispose
 
     close_barrier(&barrier);
 
-    close_sem(mutex);
+    close_sem(atom_mutex);
     close_sem(hydro_queue);
     close_sem(oxy_queue);
 }
@@ -390,21 +415,23 @@ void oxy_process(long hydro_count, long intro_wait, long mol_wait, long id)
 // Function for Hydrogen processes.
 void hydro_process(long oxy_count, long hydro_count, long intro_wait, long id)
 {
-    srand(getpid() * time(NULL)); // Make atoms get somewhat unique wait times.
     write_log("H %ld: started\n", id);
 
+    srand(getpid() * time(NULL)); // Make atoms get somewhat unique wait times.
     usleep(RAND_MICROS(intro_wait));
 
     write_log("H %ld: going to queue\n", id);
 
-    sem_t *mutex = open_sem(MUTEX_ATOM_KEY);
+    // Setup
+
+    sem_t *atom_mutex = open_sem(MUTEX_ATOM_KEY);
     sem_t *hydro_queue = open_sem(QUEUE_HYDRO_KEY);
     sem_t *oxy_queue = open_sem(QUEUE_OXY_KEY);
 
     barrier_t barrier;
     open_barrier(&barrier, SHM_ATOM_BARRIER_KEY, BARRIER_ATOM_KEY, 3);
 
-    wait_sem(mutex);
+    wait_sem(atom_mutex);
 
     // Increase hydrogen count
 
@@ -421,6 +448,7 @@ void hydro_process(long oxy_count, long hydro_count, long intro_wait, long id)
         post_sem(hydro_queue);
         post_sem(hydro_queue);
         *hydro_q_count = *hydro_q_count - 2;
+
         post_sem(oxy_queue);
         *oxy_q_count = *oxy_q_count - 1;
     }
@@ -428,21 +456,37 @@ void hydro_process(long oxy_count, long hydro_count, long intro_wait, long id)
     {
         // Figure whether more bonds are possible
 
-        if (oxy_count - *mol_count < 1 || hydro_count - *mol_count * 2 < 2)
+        // NO MORE OXYGEN IS AVAILABLE
+        // QUEUE % 2 = 1 AND NO MORE HYDROGEN IS COMING
+
+        if (oxy_count - *mol_count < 1 || (*hydro_q_count % 2 == 1 && hydro_count - *hydro_q_count - *mol_count * 2 == 0))
         {
             write_log("H %ld: not enough O or H\n", id);
+
+            post_sem(atom_mutex);
+
+            unlink_shm(hydro_q_count);
+            unlink_shm(oxy_q_count);
+            unlink_shm(mol_count);
+
+            // Dispose
+
+            close_barrier(&barrier);
+
+            close_sem(atom_mutex);
+            close_sem(hydro_queue);
+            close_sem(oxy_queue);
+
             return;
         }
 
-        post_sem(mutex);
+        post_sem(atom_mutex);
     }
 
     unlink_shm(hydro_q_count);
     unlink_shm(oxy_q_count);
 
-    wait_sem(hydro_queue);
-
-    // Make a bond
+    wait_sem(hydro_queue); // QUEUE
 
     write_log("H %ld: creating molecule %d\n", id, *mol_count);
 
@@ -452,13 +496,11 @@ void hydro_process(long oxy_count, long hydro_count, long intro_wait, long id)
 
     unlink_shm(mol_count);
 
-    post_sem(mutex);
-
     // Dispose
 
     close_barrier(&barrier);
 
-    close_sem(mutex);
+    close_sem(atom_mutex);
     close_sem(hydro_queue);
     close_sem(oxy_queue);
 }
@@ -548,6 +590,7 @@ int main(int argc, char *argv[])
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 
+    dispose();
     initialize();
     atexit(dispose);
 
