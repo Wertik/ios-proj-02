@@ -11,12 +11,10 @@
 #include <sys/mman.h>
 #include <stdarg.h>
 
-#define SHM_KEY "/atom_queue"
-
 typedef struct
 {
     sem_t *sem;
-    int *shm_count;
+    int *count;
     int size;
 
     const char *shm_key;
@@ -42,6 +40,8 @@ typedef struct
 
 #define RAND_MICROS(limit) (rand() % (limit + 1)) * 1000
 
+// Parse a long from a string argument.
+// Has to be a positive whole number.
 bool parse_long(char *str, long *res)
 {
     char *ptr;
@@ -63,55 +63,109 @@ bool parse_long(char *str, long *res)
     return true;
 }
 
+// Semaphor operations guarded by error checks.
+
 void init_sem(const char *key, unsigned int value)
 {
     sem_t *sem = sem_open(key, O_CREAT, 0666, value);
-    sem_close(sem);
+
+    if (sem == SEM_FAILED)
+    {
+        perror("init_sem (sem_open)");
+        _exit(EXIT_FAILURE);
+    }
+
+    if (sem_close(sem) == -1)
+    {
+        perror("init_sem (sem_close)");
+        _exit(EXIT_FAILURE);
+    }
 }
 
-bool unlink_shm(int *a)
+sem_t *open_sem(const char *key)
+{
+    sem_t *sem = sem_open(key, O_RDWR);
+
+    if (sem == SEM_FAILED)
+    {
+        perror("open_sem");
+        _exit(EXIT_FAILURE);
+    }
+
+    return sem;
+}
+
+void wait_sem(sem_t *sem)
+{
+    if (sem_wait(sem) == -1)
+    {
+        perror("wait_sem");
+        _exit(EXIT_FAILURE);
+    }
+}
+
+void post_sem(sem_t *sem)
+{
+    if (sem_post(sem) == -1)
+    {
+        perror("post_sem");
+        _exit(EXIT_FAILURE);
+    }
+}
+
+void close_sem(sem_t *sem)
+{
+    if (sem_close(sem) == -1)
+    {
+        perror("close_sem");
+        _exit(EXIT_FAILURE);
+    }
+}
+
+// Shared memory operations.
+
+void unlink_shm(int *a)
 {
     if (munmap(a, SHM_INT_SIZE) == -1)
     {
-        perror("munmap");
-        return false;
+        perror("unlink_shm (munmap)");
+        _exit(EXIT_FAILURE);
     }
-    return true;
 }
 
-bool init_shm_int(const char *key, int initial_value)
+void init_shm_int(const char *key, int initial_value)
 {
     int id = shm_open(key, O_CREAT | O_RDWR, S_IWUSR | S_IRUSR);
 
     if (id == -1)
     {
-        perror("shm_open");
-        return false;
+        perror("init_shm_int (shm_open)");
+        _exit(EXIT_FAILURE);
     }
 
     if (ftruncate(id, SHM_INT_SIZE) == -1)
     {
-        perror("ftruncate");
-        return false;
+        perror("init_shm_int (ftruncate)");
+        _exit(EXIT_FAILURE);
     }
 
     int *a = (int *)mmap(NULL, SHM_INT_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, id, 0);
 
     if (a == MAP_FAILED)
     {
-        perror("mmap");
-        return false;
+        perror("init_shm_int (mmap)");
+        _exit(EXIT_FAILURE);
     }
 
     if (close(id) == -1)
     {
-        perror("close");
-        return false;
+        perror("init_shm_int (close)");
+        _exit(EXIT_FAILURE);
     }
 
     *a = initial_value;
 
-    return unlink_shm(a);
+    unlink_shm(a);
 }
 
 int *link_shm_int(const char *key)
@@ -120,88 +174,120 @@ int *link_shm_int(const char *key)
 
     if (id == -1)
     {
-        perror("shm_open");
-        return NULL;
+        perror("link_shm_int (shm_open)");
+        _exit(EXIT_FAILURE);
     }
 
     int *a = (int *)mmap(NULL, SHM_INT_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, id, 0);
 
     if (a == MAP_FAILED)
     {
-        perror("munmap");
-        return NULL;
+        perror("link_shm_int (munmap)");
+        _exit(EXIT_FAILURE);
     }
 
-    close(id);
+    if (close(id) == -1)
+    {
+        perror("link_shm_int (close)");
+        _exit(EXIT_FAILURE);
+    }
 
     return a;
 }
 
+// Barrier operations
+// Handle errors seperately, allows easier debugging(?).
+
+// Initialize a barrier
+void init_barrier(const char *shm_key, const char *sem_key)
+{
+    init_shm_int(shm_key, 0);
+    init_sem(sem_key, 0);
+}
+
 // Open a barrier
-bool open_barrier(barrier_t *barrier, const char *shm_key, const char *sem_key, int size)
+void open_barrier(barrier_t *barrier, const char *shm_key, const char *sem_key, int size)
 {
     // Load shm
-    barrier->shm_count = link_shm_int(shm_key);
+    barrier->count = link_shm_int(shm_key);
     barrier->size = size;
 
     // Setup semaphor
     barrier->sem = sem_open(sem_key, O_RDWR);
 
-    return true; // TODO: Handle errors
-}
-
-// Initialize a barrier
-bool init_barrier(const char *shm_key, const char *sem_key)
-{
-    init_shm_int(shm_key, 0);
-    init_sem(sem_key, 0);
-
-    return true; // TODO: Handle errors
+    if (barrier->sem == NULL)
+    {
+        perror("open_barrier (sem_open)");
+        _exit(EXIT_FAILURE);
+    }
 }
 
 // Join processes from barrier
 void join_barrier(barrier_t *barrier)
 {
-    *(barrier->shm_count) = *(barrier->shm_count) + 1;
+    *(barrier->count) = *(barrier->count) + 1;
 
-    if (*(barrier->shm_count) == barrier->size)
+    if (*(barrier->count) == barrier->size)
     {
         for (int i = 0; i < barrier->size - 1; i++)
         {
-            sem_post(barrier->sem);
+            if (sem_post(barrier->sem) == -1)
+            {
+                perror("join_barrier (sem_post)");
+                _exit(EXIT_FAILURE);
+            }
         }
-        *(barrier->shm_count) = 0;
+        *(barrier->count) = 0;
     }
     else
     {
-        sem_wait(barrier->sem);
+        if (sem_wait(barrier->sem) == -1)
+        {
+            perror("join_barrier (sem_wait)");
+            _exit(EXIT_FAILURE);
+        }
     }
 }
 
 void close_barrier(barrier_t *barrier)
 {
-    unlink_shm(barrier->shm_count);
-    sem_close(barrier->sem);
+    if (sem_close(barrier->sem) == -1)
+    {
+        perror("close_barrier (sem_close)");
+        _exit(EXIT_FAILURE);
+    }
+
+    unlink_shm(barrier->count);
 }
 
 // Unlink the barrier shared memory and semaphor
-bool unlink_barrier(const char *shm_key, const char *sem_key)
+void unlink_barrier(const char *shm_key, const char *sem_key)
 {
-    shm_unlink(shm_key);
-    sem_unlink(sem_key);
+    if (shm_unlink(shm_key) == -1)
+    {
+        perror("unlink_barrier (shm_unlink)");
+        _exit(EXIT_FAILURE);
+    }
 
-    return true; // TODO: Errors
+    if (sem_unlink(sem_key) == -1)
+    {
+        perror("unlink_barrier (sem_unlink)");
+        _exit(EXIT_FAILURE);
+    }
 }
 
+// Write an entry into the log file.
 void write_log(const char *entry, ...)
 {
-    sem_t *mutex = sem_open(MUTEX_LOG_KEY, O_RDWR);
+    sem_t *mutex = open_sem(MUTEX_LOG_KEY);
 
     va_list v_list;
     va_start(v_list, entry);
 
-    sem_wait(mutex);
+    wait_sem(mutex);
 
+// Debug printing into console instead of file.
+#ifndef PRINT_CONSOLE
     FILE *log = fopen("proj2.out", "a");
 
     int *a = link_shm_int(SHM_A_KEY);
@@ -214,13 +300,17 @@ void write_log(const char *entry, ...)
     vfprintf(log, entry, v_list);
 
     fclose(log);
+#else
+    vprintf(entry, v_list);
+#endif
 
-    sem_post(mutex);
+    post_sem(mutex);
 
-    sem_close(mutex);
+    close_sem(mutex);
 }
 
-void oxy_process(long intro_wait, long mol_wait, long id)
+// Function for Oxygen processes.
+void oxy_process(long hydro_count, long intro_wait, long mol_wait, long id)
 {
     srand(getpid() * time(NULL));
     write_log("O %ld: started\n", id);
@@ -229,42 +319,50 @@ void oxy_process(long intro_wait, long mol_wait, long id)
 
     write_log("O %ld: going to queue\n", id);
 
-    sem_t *mutex = sem_open(MUTEX_ATOM_KEY, O_RDWR);
-    sem_t *hydro_queue = sem_open(QUEUE_HYDRO_KEY, O_RDWR);
-    sem_t *oxy_queue = sem_open(QUEUE_OXY_KEY, O_RDWR);
+    sem_t *mutex = open_sem(MUTEX_ATOM_KEY);
+    sem_t *hydro_queue = open_sem(QUEUE_HYDRO_KEY);
+    sem_t *oxy_queue = open_sem(QUEUE_OXY_KEY);
 
     barrier_t barrier;
-    open_barrier(&barrier, SHM_ATOM_BARRIER_KEY, BARRIER_ATOM_KEY, 3); // TODO: Check errors
+    open_barrier(&barrier, SHM_ATOM_BARRIER_KEY, BARRIER_ATOM_KEY, 3);
 
-    sem_wait(mutex);
+    wait_sem(mutex);
 
     // Increase oxygen count
 
-    int *oxy_count = link_shm_int(SHM_OXY_KEY);
-    int *hydro_count = link_shm_int(SHM_HYDRO_KEY);
+    int *oxy_q_count = link_shm_int(SHM_OXY_KEY);
+    int *hydro_q_count = link_shm_int(SHM_HYDRO_KEY);
     int *mol_count = link_shm_int(SHM_MOL_KEY);
 
-    *oxy_count = *oxy_count + 1;
+    *oxy_q_count = *oxy_q_count + 1;
 
-    if (*hydro_count >= 2)
+    if (*hydro_q_count >= 2)
     {
         *mol_count = *mol_count + 1;
 
-        sem_post(hydro_queue);
-        sem_post(hydro_queue);
-        *hydro_count = *hydro_count - 2;
-        sem_post(oxy_queue);
-        *oxy_count = *oxy_count - 1;
+        post_sem(hydro_queue);
+        post_sem(hydro_queue);
+        *hydro_q_count = *hydro_q_count - 2;
+        post_sem(oxy_queue);
+        *oxy_q_count = *oxy_q_count - 1;
     }
     else
     {
-        sem_post(mutex);
+        // Figure whether more bonds are possible
+
+        if (hydro_count - *mol_count * 2 < 2)
+        {
+            write_log("O %ld: not enough H\n", id);
+            return;
+        }
+
+        post_sem(mutex);
     }
 
-    unlink_shm(oxy_count);
-    unlink_shm(hydro_count);
+    unlink_shm(oxy_q_count);
+    unlink_shm(hydro_q_count);
 
-    sem_wait(oxy_queue);
+    wait_sem(oxy_queue);
 
     // Make a bond
 
@@ -278,62 +376,74 @@ void oxy_process(long intro_wait, long mol_wait, long id)
 
     unlink_shm(mol_count);
 
-    sem_post(mutex);
-    
+    post_sem(mutex);
+
+    // Dispose
+
     close_barrier(&barrier);
 
-    sem_close(mutex);
-    sem_close(hydro_queue);
-    sem_close(oxy_queue);
+    close_sem(mutex);
+    close_sem(hydro_queue);
+    close_sem(oxy_queue);
 }
 
-void hydro_process(long intro_wait, long id)
+// Function for Hydrogen processes.
+void hydro_process(long oxy_count, long hydro_count, long intro_wait, long id)
 {
-    srand(getpid() * time(NULL));
+    srand(getpid() * time(NULL)); // Make atoms get somewhat unique wait times.
     write_log("H %ld: started\n", id);
 
     usleep(RAND_MICROS(intro_wait));
 
     write_log("H %ld: going to queue\n", id);
 
-    sem_t *mutex = sem_open(MUTEX_ATOM_KEY, O_RDWR);
-    sem_t *hydro_queue = sem_open(QUEUE_HYDRO_KEY, O_RDWR);
-    sem_t *oxy_queue = sem_open(QUEUE_OXY_KEY, O_RDWR);
+    sem_t *mutex = open_sem(MUTEX_ATOM_KEY);
+    sem_t *hydro_queue = open_sem(QUEUE_HYDRO_KEY);
+    sem_t *oxy_queue = open_sem(QUEUE_OXY_KEY);
 
     barrier_t barrier;
     open_barrier(&barrier, SHM_ATOM_BARRIER_KEY, BARRIER_ATOM_KEY, 3);
 
-    sem_wait(mutex);
+    wait_sem(mutex);
 
     // Increase hydrogen count
 
-    int *oxy_count = link_shm_int(SHM_OXY_KEY);
-    int *hydro_count = link_shm_int(SHM_HYDRO_KEY);
+    int *oxy_q_count = link_shm_int(SHM_OXY_KEY);
+    int *hydro_q_count = link_shm_int(SHM_HYDRO_KEY);
     int *mol_count = link_shm_int(SHM_MOL_KEY);
 
-    *hydro_count = *hydro_count + 1;
+    *hydro_q_count = *hydro_q_count + 1;
 
-    if (*hydro_count >= 2 && *oxy_count >= 1)
+    if (*hydro_q_count >= 2 && *oxy_q_count >= 1)
     {
         *mol_count = *mol_count + 1;
 
-        sem_post(hydro_queue);
-        sem_post(hydro_queue);
-        *hydro_count = *hydro_count - 2;
-        sem_post(oxy_queue);
-        *oxy_count = *oxy_count - 1;
+        post_sem(hydro_queue);
+        post_sem(hydro_queue);
+        *hydro_q_count = *hydro_q_count - 2;
+        post_sem(oxy_queue);
+        *oxy_q_count = *oxy_q_count - 1;
     }
     else
     {
-        sem_post(mutex);
+        // Figure whether more bonds are possible
+
+        if (oxy_count - *mol_count < 1 || hydro_count - *mol_count * 2 < 2)
+        {
+            write_log("H %ld: not enough O or H\n", id);
+            return;
+        }
+
+        post_sem(mutex);
     }
 
-    unlink_shm(hydro_count);
-    unlink_shm(oxy_count);
+    unlink_shm(hydro_q_count);
+    unlink_shm(oxy_q_count);
 
-    sem_wait(hydro_queue);
+    wait_sem(hydro_queue);
 
     // Make a bond
+
     write_log("H %ld: creating molecule %d\n", id, *mol_count);
 
     join_barrier(&barrier); // When all 3 atoms are ready to create the molecule this passes through.
@@ -342,13 +452,65 @@ void hydro_process(long intro_wait, long id)
 
     unlink_shm(mol_count);
 
-    sem_post(mutex);
+    post_sem(mutex);
+
+    // Dispose
 
     close_barrier(&barrier);
 
-    sem_close(mutex);
-    sem_close(hydro_queue);
-    sem_close(oxy_queue);
+    close_sem(mutex);
+    close_sem(hydro_queue);
+    close_sem(oxy_queue);
+}
+
+void initialize()
+{
+    // Clear the output file.
+
+    FILE *fd = fopen("proj2.out", "w");
+    if (fd == NULL)
+    {
+        perror("main (fopen)");
+        exit(EXIT_FAILURE);
+    }
+
+    if (fclose(fd) == EOF)
+    {
+        perror("main (fclose)");
+        exit(EXIT_FAILURE);
+    }
+
+    // Initialize all the shared memory and semaphors.
+
+    init_sem(MUTEX_LOG_KEY, 1);
+    init_sem(MUTEX_ATOM_KEY, 1);
+
+    init_sem(QUEUE_HYDRO_KEY, 0);
+    init_sem(QUEUE_OXY_KEY, 0);
+
+    init_barrier(SHM_ATOM_BARRIER_KEY, BARRIER_ATOM_KEY);
+
+    init_shm_int(SHM_A_KEY, 1);
+    init_shm_int(SHM_OXY_KEY, 0);
+    init_shm_int(SHM_HYDRO_KEY, 0);
+    init_shm_int(SHM_MOL_KEY, 0);
+}
+
+void dispose()
+{
+    // Dispose of shared memory and semaphors.
+
+    sem_unlink(MUTEX_LOG_KEY);
+    sem_unlink(MUTEX_ATOM_KEY);
+    sem_unlink(QUEUE_HYDRO_KEY);
+    sem_unlink(QUEUE_OXY_KEY);
+
+    unlink_barrier(SHM_ATOM_BARRIER_KEY, BARRIER_ATOM_KEY);
+
+    shm_unlink(SHM_A_KEY);
+    shm_unlink(SHM_HYDRO_KEY);
+    shm_unlink(SHM_OXY_KEY);
+    shm_unlink(SHM_MOL_KEY);
 }
 
 int main(int argc, char *argv[])
@@ -383,25 +545,11 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    fclose(fopen("proj2.out", "w"));
-
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 
-    // Initialize all the shared memory and semaphors.
-
-    init_sem(MUTEX_LOG_KEY, 1);
-    init_sem(MUTEX_ATOM_KEY, 1);
-
-    init_sem(QUEUE_HYDRO_KEY, 0);
-    init_sem(QUEUE_OXY_KEY, 0);
-
-    init_barrier(SHM_ATOM_BARRIER_KEY, BARRIER_ATOM_KEY);
-
-    init_shm_int(SHM_A_KEY, 1);
-    init_shm_int(SHM_OXY_KEY, 0);
-    init_shm_int(SHM_HYDRO_KEY, 0);
-    init_shm_int(SHM_MOL_KEY, 0);
+    initialize();
+    atexit(dispose);
 
     // Create oxygen processes
 
@@ -414,14 +562,14 @@ int main(int argc, char *argv[])
 
         if (oxy_id < 0)
         {
-            perror("fork");
-            return 2;
+            perror("main (fork)");
+            return EXIT_FAILURE;
         }
 
         if (oxy_id == 0)
         {
-            oxy_process(wait_intro, wait_creat, i);
-            _exit(0);
+            oxy_process(hydro_count, wait_intro, wait_creat, i);
+            _exit(EXIT_SUCCESS);
         }
         else
         {
@@ -436,14 +584,14 @@ int main(int argc, char *argv[])
 
         if (hydro_id < 0)
         {
-            perror("fork");
-            return 2;
+            perror("main (fork)");
+            return EXIT_FAILURE;
         }
 
         if (hydro_id == 0)
         {
-            hydro_process(wait_intro, i);
-            _exit(0);
+            hydro_process(oxy_count, hydro_count, wait_intro, i);
+            _exit(EXIT_SUCCESS);
         }
         else
         {
@@ -452,29 +600,12 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Wait for all the processes to finish.
+
     for (long i = 0; i < pids_len; i++)
     {
         waitpid(pids[i], NULL, 0);
     }
 
-    int *f_oxy_count = link_shm_int(SHM_OXY_KEY);
-    int *f_hydro_count = link_shm_int(SHM_HYDRO_KEY);
-
-    unlink_shm(f_oxy_count);
-    unlink_shm(f_hydro_count);
-
-    // Dispose of shared memory and semaphors.
-
-    sem_unlink(MUTEX_LOG_KEY);
-    sem_unlink(MUTEX_ATOM_KEY);
-    sem_unlink(QUEUE_HYDRO_KEY);
-    sem_unlink(QUEUE_OXY_KEY);
-
-    unlink_barrier(SHM_ATOM_BARRIER_KEY, BARRIER_ATOM_KEY);
-
-    shm_unlink(SHM_A_KEY);
-    shm_unlink(SHM_HYDRO_KEY);
-    shm_unlink(SHM_OXY_KEY);
-    shm_unlink(SHM_MOL_KEY);
-    return 0;
+    return EXIT_SUCCESS;
 }
