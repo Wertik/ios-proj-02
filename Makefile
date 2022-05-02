@@ -15,7 +15,7 @@ pack: proj2.zip
 
 # Redirect output from file to stdout. Easier to debug.
 debug: main.c
-	$(CC) $(CFLAGS) -o proj2 main.c -lrt -pthread -DPRINT_CONSOLE
+	$(CC) $(CFLAGS) -o proj2 main.c -lrt -pthread -DP_DEBUG
 
 clean:
 	rm -f $(OBJS) $(TARGET)

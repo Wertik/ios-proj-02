@@ -26,8 +26,8 @@ typedef struct
 
 #define MUTEX_LOG_KEY "/ios-log-mutex"
 #define MUTEX_ATOM_KEY "/ios-atom-mutex"
-#define MUTEX_QUEUE_KEY "/ios-atom-queue-mutex"
-#define MUTEX_MOL_KEY "/ios-mol-queue-mutex"
+#define MUTEX_MOL_O_KEY "/ios-mol-o-mutex"
+#define MUTEX_MOL_H_KEY "/ios-mol-h-mutex"
 
 #define QUEUE_HYDRO_KEY "/ios-hydro-queue"
 #define QUEUE_OXY_KEY "/ios-oxy-queue"
@@ -43,10 +43,25 @@ typedef struct
 
 #define RAND_MICROS(limit) (rand() % (limit + 1)) * 1000
 
+#ifdef P_DEBUG
+#define DEBUG printf
+#else
+#define DEBUG \
+    do        \
+    {         \
+    } while (0)
+#endif
+
 // Parse a long from a string argument.
 // Has to be a positive whole number.
 bool parse_long(char *str, long *res)
 {
+    if (str[0] == '\0')
+    {
+        fprintf(stderr, "Empty value.\n");
+        return false;
+    }
+
     char *ptr;
     long value = strtol(str, &ptr, 10);
 
@@ -297,7 +312,7 @@ void write_log(const char *entry, ...)
     wait_sem(mutex);
 
 // Debug printing into console instead of file.
-#ifndef PRINT_CONSOLE
+#ifndef P_DEBUG
     FILE *log = fopen("proj2.out", "a");
 
     int *a = link_shm_int(SHM_A_KEY);
@@ -327,18 +342,21 @@ void oxy_process(long hydro_count, long intro_wait, long mol_wait, long id)
     srand(getpid() * time(NULL));
     usleep(RAND_MICROS(intro_wait));
 
-    write_log("O %ld: going to queue\n", id);
-
     // GOING INTO QUEUE
 
     sem_t *atom_mutex = open_sem(MUTEX_ATOM_KEY);
+    sem_t *mol_o_mutex = open_sem(MUTEX_MOL_O_KEY);
+    sem_t *mol_h_mutex = open_sem(MUTEX_MOL_H_KEY);
     sem_t *hydro_queue = open_sem(QUEUE_HYDRO_KEY);
     sem_t *oxy_queue = open_sem(QUEUE_OXY_KEY);
 
     barrier_t barrier;
     open_barrier(&barrier, SHM_ATOM_BARRIER_KEY, BARRIER_ATOM_KEY, 3);
 
+    wait_sem(mol_o_mutex);
     wait_sem(atom_mutex);
+
+    write_log("O %ld: going to queue\n", id);
 
     // Increase oxygen count, release atoms for molecule if possible
 
@@ -365,7 +383,7 @@ void oxy_process(long hydro_count, long intro_wait, long mol_wait, long id)
     {
         // Figure whether more bonds are possible
 
-        if (hydro_count - *mol_count * 2 < 2 || *oxy_q_count * 2 + *mol_count * 2 > hydro_count)
+        if (hydro_count - *mol_count * 2 < 2)
         {
             write_log("O %ld: not enough H\n", id);
 
@@ -374,6 +392,7 @@ void oxy_process(long hydro_count, long intro_wait, long mol_wait, long id)
             unlink_shm(mol_count);
 
             post_sem(atom_mutex);
+            post_sem(mol_o_mutex);
 
             close_barrier(&barrier);
 
@@ -402,6 +421,9 @@ void oxy_process(long hydro_count, long intro_wait, long mol_wait, long id)
     unlink_shm(mol_count);
 
     post_sem(atom_mutex);
+    post_sem(mol_o_mutex);
+    post_sem(mol_h_mutex);
+    post_sem(mol_h_mutex);
 
     // Dispose
 
@@ -420,18 +442,20 @@ void hydro_process(long oxy_count, long hydro_count, long intro_wait, long id)
     srand(getpid() * time(NULL)); // Make atoms get somewhat unique wait times.
     usleep(RAND_MICROS(intro_wait));
 
-    write_log("H %ld: going to queue\n", id);
-
     // Setup
 
     sem_t *atom_mutex = open_sem(MUTEX_ATOM_KEY);
+    sem_t *mol_h_mutex = open_sem(MUTEX_MOL_H_KEY);
     sem_t *hydro_queue = open_sem(QUEUE_HYDRO_KEY);
     sem_t *oxy_queue = open_sem(QUEUE_OXY_KEY);
 
     barrier_t barrier;
     open_barrier(&barrier, SHM_ATOM_BARRIER_KEY, BARRIER_ATOM_KEY, 3);
 
+    wait_sem(mol_h_mutex);
     wait_sem(atom_mutex);
+
+    write_log("H %ld: going to queue\n", id);
 
     // Increase hydrogen count
 
@@ -464,6 +488,7 @@ void hydro_process(long oxy_count, long hydro_count, long intro_wait, long id)
             write_log("H %ld: not enough O or H\n", id);
 
             post_sem(atom_mutex);
+            post_sem(mol_h_mutex);
 
             unlink_shm(hydro_q_count);
             unlink_shm(oxy_q_count);
@@ -526,6 +551,8 @@ void initialize()
 
     init_sem(MUTEX_LOG_KEY, 1);
     init_sem(MUTEX_ATOM_KEY, 1);
+    init_sem(MUTEX_MOL_O_KEY, 1);
+    init_sem(MUTEX_MOL_H_KEY, 2);
 
     init_sem(QUEUE_HYDRO_KEY, 0);
     init_sem(QUEUE_OXY_KEY, 0);
@@ -544,6 +571,9 @@ void dispose()
 
     sem_unlink(MUTEX_LOG_KEY);
     sem_unlink(MUTEX_ATOM_KEY);
+    sem_unlink(MUTEX_MOL_O_KEY);
+    sem_unlink(MUTEX_MOL_H_KEY);
+
     sem_unlink(QUEUE_HYDRO_KEY);
     sem_unlink(QUEUE_OXY_KEY);
 
@@ -559,7 +589,7 @@ int main(int argc, char *argv[])
 {
     // Process arguments
 
-    if (argc < 4)
+    if (argc != 5)
     {
         fprintf(stderr, "Invalid number of arguments.\n");
         return EXIT_FAILURE;
@@ -572,6 +602,11 @@ int main(int argc, char *argv[])
         !parse_long(argv[3], &wait_intro) ||
         !parse_long(argv[4], &wait_creat))
     {
+        return EXIT_FAILURE;
+    }
+
+    if (oxy_count == 0 && hydro_count == 0) {
+        fprintf(stderr, "No atoms.\n");
         return EXIT_FAILURE;
     }
 
@@ -599,6 +634,10 @@ int main(int argc, char *argv[])
     pid_t pids[oxy_count + hydro_count];
     long pids_len = 0;
 
+#ifdef P_DEBUG
+    long ids[oxy_count + hydro_count];
+#endif
+
     for (long i = 1; i <= oxy_count; i++)
     {
         pid_t oxy_id = fork();
@@ -616,7 +655,10 @@ int main(int argc, char *argv[])
         }
         else
         {
-            // Parent
+// Parent
+#ifdef P_DEBUG
+            ids[pids_len] = i;
+#endif
             pids[pids_len++] = oxy_id;
         }
     }
@@ -638,7 +680,10 @@ int main(int argc, char *argv[])
         }
         else
         {
-            // Parent
+// Parent
+#ifdef P_DEBUG
+            ids[pids_len] = i;
+#endif
             pids[pids_len++] = hydro_id;
         }
     }
@@ -647,6 +692,9 @@ int main(int argc, char *argv[])
 
     for (long i = 0; i < pids_len; i++)
     {
+#ifdef P_DEBUG
+        printf("Waiting for %s%ld...\n", i < oxy_count ? "O" : "H", ids[i]);
+#endif
         waitpid(pids[i], NULL, 0);
     }
 
